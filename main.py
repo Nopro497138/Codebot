@@ -1,26 +1,13 @@
-# This is the whole code for the bot. You can copy it but you NEED to ask us first.
-# If you do it without permission then we have to take action.
-
-
-
-
-
-
-
-
-
-
-
-
-
+# bot.py
+# NOTE: keep your DISCORD_TOKEN and PISTON_URL in environment variables (.env or Railway env)
 import os
 import re
-import json
 import sqlite3
-import textwrap
 import aiohttp
 import asyncio
 from io import BytesIO
+from typing import Union
+
 from PIL import Image, ImageDraw, ImageFont
 import discord
 from discord import app_commands
@@ -28,16 +15,16 @@ from discord.ext import commands
 
 # ---------- CONFIG ----------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-PISTON_URL = os.getenv("PISTON_URL", "http://localhost:2000")  # z.B. http://localhost:2000
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional, für KI-Reviews (Platzhalter)
+PISTON_URL = os.getenv("PISTON_URL", "http://localhost:2000")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional, placeholder for AI review integration
 DB_PATH = os.getenv("DB_PATH", "submissions.db")
-MAX_CODE_LENGTH = 8000  # fallback limit for code field
+MAX_CODE_LENGTH = int(os.getenv("MAX_CODE_LENGTH", "8000"))
 # ----------------------------
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------- DB helpers ----------
+# ---------- DB helpers (sqlite) ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -72,14 +59,14 @@ def init_db():
     conn.commit()
     conn.close()
 
-def set_form_channel(guild_id: int, channel_id: int):
+def set_form_channel_db(guild_id: int, channel_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("INSERT OR REPLACE INTO guild_config(guild_id, form_channel_id) VALUES (?, ?)", (guild_id, channel_id))
     conn.commit()
     conn.close()
 
-def get_form_channel(guild_id: int):
+def get_form_channel_db(guild_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT form_channel_id FROM guild_config WHERE guild_id = ?", (guild_id,))
@@ -110,6 +97,9 @@ def update_submission_result(submission_id, status=None, ai_summary=None, stdout
         sets.append("run_stdout = ?"); vals.append(stdout)
     if stderr is not None:
         sets.append("run_stderr = ?"); vals.append(stderr)
+    if not sets:
+        conn.close()
+        return
     vals.append(submission_id)
     cur.execute(f"UPDATE submissions SET {', '.join(sets)} WHERE id = ?", vals)
     conn.commit()
@@ -140,45 +130,37 @@ SUSPICIOUS_PATTERNS = [
 def static_risk_check(code: str):
     """Very simple heuristic scanner. Returns (risk_level:int 0-100, reasons:list)."""
     reasons = []
-    lowered = code.lower()
     score = 0
     for pat in SUSPICIOUS_PATTERNS:
         if re.search(pat, code):
-            reasons.append(f"Matched suspicious pattern `{pat}`")
+            reasons.append(f"Matched suspicious pattern: `{pat}`")
             score += 30
-    # length/obfuscation heuristics
-    if re.search(r"[A-Za-z0-9+/]{50,}={0,2}", code):  # base64 blob heuristic
+    if re.search(r"[A-Za-z0-9+/]{50,}={0,2}", code):  # base64-like long blob heuristic
         reasons.append("Detected long base64-like blob (possible obfuscation).")
         score += 20
-    # Network/file IO
-    if re.search(r"\b(open|os\.open|Path\()", code) and re.search(r"read|write|w\+|rb", lowered):
+    if re.search(r"\b(open|os\.open|Path\()", code) and re.search(r"read|write|w\+|rb", code, re.IGNORECASE):
         reasons.append("Contains file read/write patterns.")
         score += 10
     score = min(100, score)
     return score, reasons
 
-# ---------- AI review placeholders ----------
+# ---------- AI review placeholder ----------
 async def ai_review_code(code: str, language: str) -> dict:
     """
-    Platzhalter für KI-Review: Wenn OPENAI_API_KEY gesetzt ist, kannst du hier
-    einen echten OpenAI-Aufruf implementieren. Rückgabewert sollte ein dict sein:
-      { "risk_score": int(0-100), "summary": str }
-    Aktuell: kombinieren statische heuristics + simple summary.
+    Placeholder for AI review. Combine static heuristics + simple summary.
+    Return: { "risk_score": int(0-100), "summary": str }
     """
     risk_score, reasons = static_risk_check(code)
-    # lightweight "summary"
-    summary = "Automatische Zusammenfassung:\n"
+    summary = "Auto-summary:\n"
     first_lines = "\n".join(code.splitlines()[:10])
-    summary += f"Erste Zeilen:\n```\n{first_lines}\n```\n"
+    summary += f"First lines:\n```\n{first_lines}\n```\n"
     if reasons:
-        summary += "Potentielle Risiken:\n- " + "\n- ".join(reasons)
+        summary += "Potential risks:\n- " + "\n- ".join(reasons)
     else:
-        summary += "Keine offensichtlichen statischen Risk-Marker gefunden."
+        summary += "No obvious static risk markers found."
     return {"risk_score": risk_score, "summary": summary}
 
 # ---------- Piston execution ----------
-# NOTE: You must run your own piston instance or set PISTON_URL to a trusted one.
-# Docs: https://piston.readthedocs.io/en/latest/api-v2/
 async def run_code_in_piston(session: aiohttp.ClientSession, language: str, code: str, timeout_ms: int = 3000):
     url = PISTON_URL.rstrip("/") + "/api/v2/execute"
     payload = {
@@ -190,17 +172,19 @@ async def run_code_in_piston(session: aiohttp.ClientSession, language: str, code
         "args": [],
         "run_timeout": timeout_ms
     }
-    async with session.post(url, json=payload, timeout=10) as resp:
-        if resp.status != 200:
-            text = await resp.text()
-            return {"error": f"Piston returned status {resp.status}: {text}"}
-        return await resp.json()
+    try:
+        async with session.post(url, json=payload, timeout=15) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                return {"error": f"Piston returned status {resp.status}: {text}"}
+            return await resp.json()
+    except asyncio.TimeoutError:
+        return {"error": "Timeout while contacting Piston execution service."}
+    except Exception as e:
+        return {"error": f"Error contacting Piston: {e}"}
 
 # ---------- Create highlight "screenshot" (image) ----------
 def render_code_highlight_image(code: str, highlight_lines=(0,5)):
-    """
-    Erzeugt ein PNG mit einer Code-Auswahl. highlight_lines ist ein tuple (start,end)
-    """
     lines = code.splitlines()
     start, end = highlight_lines
     selected = lines[start:end]
@@ -208,22 +192,23 @@ def render_code_highlight_image(code: str, highlight_lines=(0,5)):
         selected = lines[:min(10, len(lines))]
 
     text = "\n".join(selected)
-    # simple image render
     font_size = 16
     try:
         font = ImageFont.truetype("DejaVuSansMono.ttf", font_size)
     except Exception:
         font = ImageFont.load_default()
     margin = 12
-    # calculate size
-    max_w = max([font.getsize(l)[0] for l in text.splitlines()] + [0])
+    # calculate size (fallbacks handled)
+    line_sizes = [font.getsize(l)[0] for l in text.splitlines()] if text.splitlines() else [0]
+    max_w = max(line_sizes + [0])
     h = (font.getsize("A")[1] * (len(text.splitlines()) + 1)) + 2 * margin
     w = max_w + 2 * margin
+    if w < 200:
+        w = 200
     img = Image.new("RGBA", (w, h), (30, 30, 34, 255))
     draw = ImageDraw.Draw(img)
     draw.text((margin, margin), text, font=font, fill=(230, 230, 230))
-    # simple highlight bar
-    draw.rectangle([0,0,w,24], fill=(50,50,55,255))
+    draw.rectangle([0,0,w,28], fill=(50,50,55,255))
     return img
 
 # ---------- Discord UI: Vote Buttons ----------
@@ -234,7 +219,6 @@ class VoteView(discord.ui.View):
 
     async def update_message_counts(self, interaction: discord.Interaction):
         votes = get_votes(self.submission_id)
-        # update embed footer with counts
         try:
             embed = interaction.message.embeds[0]
             embed.set_footer(text=f"Score: {votes['score']} • Votes: {votes['count']} • ID: {self.submission_id}")
@@ -245,13 +229,13 @@ class VoteView(discord.ui.View):
     @discord.ui.button(label="Upvote", style=discord.ButtonStyle.green, custom_id="upvote")
     async def upvote(self, interaction: discord.Interaction, button: discord.ui.Button):
         set_vote(self.submission_id, interaction.user.id, 1)
-        await interaction.response.send_message("Dein Upvote wurde registriert.", ephemeral=True)
+        await interaction.response.send_message("Your upvote has been recorded.", ephemeral=True)
         await self.update_message_counts(interaction)
 
     @discord.ui.button(label="Downvote", style=discord.ButtonStyle.red, custom_id="downvote")
     async def downvote(self, interaction: discord.Interaction, button: discord.ui.Button):
         set_vote(self.submission_id, interaction.user.id, -1)
-        await interaction.response.send_message("Dein Downvote wurde registriert.", ephemeral=True)
+        await interaction.response.send_message("Your downvote has been recorded.", ephemeral=True)
         await self.update_message_counts(interaction)
 
 # ---------- Slash commands ----------
@@ -264,122 +248,146 @@ async def on_ready():
     except Exception as e:
         print("Sync failed:", e)
 
-@bot.tree.command(name="set_form_channel", description="Setze den Kanal, in den geprüfte Codes gepostet werden (Admin only).")
+@bot.tree.command(name="set_form_channel", description="Set the channel where reviewed submissions will be posted (Admins only).")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def set_form_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    set_form_channel(interaction.guild.id, channel.id)
-    await interaction.response.send_message(f"Form-Kanal gesetzt auf {channel.mention}", ephemeral=True)
+async def set_form_channel(interaction: discord.Interaction, channel: Union[discord.TextChannel, discord.ForumChannel]):
+    # Accept TextChannel or ForumChannel
+    try:
+        set_form_channel_db(interaction.guild.id, channel.id)
+        embed = discord.Embed(title="Form Channel Set", description=f"Submissions will be posted in {channel.mention}.", color=0x2ECC71)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        embed = discord.Embed(title="Error", description=f"Could not set form channel: {e}", color=0xE74C3C)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="submit_code", description="Sende Code zur Prüfung und (optional) Ausführung.")
-@app_commands.describe(language="Programmiersprache (z. B. python, javascript, java)", code="Dein Code (als Markdown oder Plaintext)")
+@bot.tree.command(name="submit_code", description="Submit code for AI review and optional sandboxed execution.")
+@app_commands.describe(language="Programming language (e.g. python, javascript, java)", code="Your code (markdown or plain text).")
 async def submit_code(interaction: discord.Interaction, language: str, code: str):
     await interaction.response.defer(thinking=True)
     guild = interaction.guild
     if not guild:
-        await interaction.followup.send("Dieser Befehl kann nur in einem Server verwendet werden.", ephemeral=True)
+        embed = discord.Embed(title="Error", description="This command can only be used in a server.", color=0xE74C3C)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
-    form_channel_id = get_form_channel(guild.id)
+
+    form_channel_id = get_form_channel_db(guild.id)
     if not form_channel_id:
-        await interaction.followup.send("Kein Form-Kanal gesetzt. Admins können /set_form_channel benutzen.", ephemeral=True)
+        embed = discord.Embed(title="Form Channel Not Set", description="An admin must run `/set_form_channel` first.", color=0xE67E22)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
-    # basic limits
+
     if len(code) > MAX_CODE_LENGTH:
-        await interaction.followup.send(f"Code zu lang (Limit {MAX_CODE_LENGTH} Zeichen).", ephemeral=True)
+        embed = discord.Embed(title="Code Too Long", description=f"Max allowed length is {MAX_CODE_LENGTH} characters.", color=0xE74C3C)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
+
     # Save initial submission
     submission_id = save_submission(guild.id, interaction.user.id, language, code, status="reviewing")
+
     # AI static review
     aires = await ai_review_code(code, language)
     risk_score = aires["risk_score"]
     ai_summary = aires["summary"]
     update_submission_result(submission_id, ai_summary=ai_summary)
+
     if risk_score >= 50:
         update_submission_result(submission_id, status="rejected")
-        await interaction.followup.send(f"Code abgelehnt (Risikoscore {risk_score}). Gründe:\n{ai_summary}", ephemeral=True)
+        embed = discord.Embed(title="Submission Rejected", color=0xE74C3C)
+        embed.add_field(name="Risk Score", value=str(risk_score), inline=True)
+        embed.add_field(name="Reason (summary)", value=(ai_summary[:1000] if ai_summary else "—"), inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        # try to DM the user with the reason
         try:
-            await interaction.user.send(f"Dein Einreichung (ID {submission_id}) wurde abgelehnt.\nGründe:\n{ai_summary}")
+            dm_embed = discord.Embed(title=f"Submission #{submission_id} Rejected", description="Your submission was rejected by the automated review.", color=0xE74C3C)
+            dm_embed.add_field(name="Risk Score", value=str(risk_score), inline=True)
+            dm_embed.add_field(name="Summary", value=(ai_summary[:1500] if ai_summary else "—"), inline=False)
+            await interaction.user.send(embed=dm_embed)
         except Exception:
             pass
         return
 
-    # If low risk -> try to run in sandbox (Piston)
+    # Low risk -> attempt sandboxed run via Piston
     async with aiohttp.ClientSession() as session:
         try:
             result = await run_code_in_piston(session, language, code, timeout_ms=3000)
         except Exception as e:
-            result = {"error": f"Fehler beim Kontakt zur Ausführungs-Instanz: {e}"}
+            result = {"error": f"Error contacting execution service: {e}"}
 
     if "error" in result:
         update_submission_result(submission_id, status="exec_failed", stdout=None, stderr=str(result["error"]))
-        await interaction.followup.send(f"Ausführung fehlgeschlagen: {result['error']}\nDie Einreichung wurde aber zur Review-Queue hinzugefügt.", ephemeral=True)
-        # Post to form channel as "failed execution" with ai_summary
+        embed = discord.Embed(title="Execution Failed", description="Execution service returned an error.", color=0xE67E22)
+        embed.add_field(name="Note", value=(result["error"][:1500]), inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        # Post to form channel as failed execution
         channel = bot.get_channel(form_channel_id)
-        embed = discord.Embed(title=f"Code Einreichung — ID {submission_id}", color=0xDD8844)
-        embed.add_field(name="User", value=interaction.user.mention, inline=True)
-        embed.add_field(name="Language", value=language, inline=True)
-        embed.add_field(name="Status", value="Exec failed", inline=True)
-        embed.add_field(name="AI Summary", value=ai_summary[:1000] if ai_summary else "—", inline=False)
-        embed.add_field(name="Note", value=f"Execution error: {result['error'][:1000]}", inline=False)
-        await channel.send(embed=embed)
+        if channel:
+            post_embed = discord.Embed(title=f"Code Submission — ID {submission_id}", color=0xDD8844)
+            post_embed.add_field(name="User", value=interaction.user.mention, inline=True)
+            post_embed.add_field(name="Language", value=language, inline=True)
+            post_embed.add_field(name="Status", value="Execution failed", inline=True)
+            post_embed.add_field(name="AI Summary", value=(ai_summary[:1000] if ai_summary else "—"), inline=False)
+            post_embed.add_field(name="Execution Error", value=(result["error"][:1500]), inline=False)
+            await channel.send(embed=post_embed)
         return
 
-    # result contains 'run' and maybe 'compile'
-    run = result.get("run", {})
+    # Successful execution result processing
+    run = result.get("run", {}) or {}
     stdout = run.get("stdout", "") or ""
     stderr = run.get("stderr", "") or ""
-    output = run.get("output", "") or ""
-    code_highlight_snippet = "\n".join(code.splitlines()[:20])  # default highlight - first 20 lines
-    # pick a 'highlight' line from output if exists (for screenshot)
     highlight_lines = (0, min(20, max(1, len(code.splitlines()))))
     if stdout.strip():
-        # if stdout has multiple lines, choose the first non-empty
         for i, line in enumerate(stdout.splitlines()):
             if line.strip():
-                # choose the code line at same index if exists
                 highlight_lines = (i, min(i+8, len(code.splitlines())))
                 break
 
-    # create image "screenshot" of highlight
+    # Render highlight image
     img = render_code_highlight_image(code, highlight_lines)
     bio = BytesIO()
     img.save(bio, "PNG")
     bio.seek(0)
-    # AI analyze executed run (placeholder)
-    ai_analysis = f"Automatische Auswertung der Ausführung:\nExit-Code: {run.get('code')}\nStdout (kurz):\n```\n{stdout[:800]}\n```\nStderr (kurz):\n```\n{stderr[:800]}\n```\n"
+
+    ai_analysis = f"Execution analysis:\nExit Code: {run.get('code')}\nStdout (short):\n```\n{stdout[:800]}\n```\nStderr (short):\n```\n{stderr[:800]}\n```\n"
     update_submission_result(submission_id, status="completed", ai_summary=ai_analysis, stdout=stdout, stderr=stderr)
 
-    # Post into form channel with embed, image and vote buttons
+    # Post into the configured form channel
     channel = bot.get_channel(form_channel_id)
     if not channel:
-        await interaction.followup.send("Form-Kanal wurde nicht gefunden (ID gesetzt, aber channel nicht verfügbar).", ephemeral=True)
+        embed = discord.Embed(title="Error", description="Configured form channel could not be found.", color=0xE74C3C)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
-    embed = discord.Embed(title=f"Code Review — ID {submission_id}", color=0x55FF88)
-    embed.add_field(name="User", value=interaction.user.mention, inline=True)
-    embed.add_field(name="Language", value=language, inline=True)
-    embed.add_field(name="Status", value="Executed & Reviewed", inline=True)
-    embed.add_field(name="AI Analysis", value=ai_analysis[:1000] if ai_analysis else "—", inline=False)
-    embed.add_field(name="Output (kurz)", value=(stdout or "keine Ausgabe")[:1000], inline=False)
-    embed.set_footer(text=f"ID: {submission_id}")
+    post_embed = discord.Embed(title=f"Code Review — ID {submission_id}", color=0x55FF88)
+    post_embed.add_field(name="User", value=interaction.user.mention, inline=True)
+    post_embed.add_field(name="Language", value=language, inline=True)
+    post_embed.add_field(name="Status", value="Executed & Reviewed", inline=True)
+    post_embed.add_field(name="AI Analysis (short)", value=(ai_analysis[:1000] if ai_analysis else "—"), inline=False)
+    post_embed.add_field(name="Output (short)", value=(stdout or "no output")[:1000], inline=False)
+    post_embed.set_footer(text=f"ID: {submission_id}")
 
     view = VoteView(submission_id)
     file = discord.File(fp=bio, filename=f"highlight_{submission_id}.png")
-    await channel.send(embed=embed, file=file, view=view)
+    await channel.send(embed=post_embed, file=file, view=view)
 
-    await interaction.followup.send(f"Dein Code (ID {submission_id}) wurde geprüft und in {channel.mention} veröffentlicht.", ephemeral=True)
+    # confirmation to the submitter
+    confirm_embed = discord.Embed(title="Submission Posted", description=f"Your submission (ID {submission_id}) was reviewed and posted to {channel.mention}.", color=0x2ECC71)
+    await interaction.followup.send(embed=confirm_embed, ephemeral=True)
 
 # ---------- Error handling for missing perms ----------
 @set_form_channel.error
 async def set_form_channel_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.errors.MissingPermissions):
-        await interaction.response.send_message("Du brauchst Manage Server Berechtigungen um den Form-Kanal zu setzen.", ephemeral=True)
+        embed = discord.Embed(title="Permission Required", description="You need the Manage Server permission to set the form channel.", color=0xE74C3C)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
     else:
-        await interaction.response.send_message("Fehler: " + str(error), ephemeral=True)
+        embed = discord.Embed(title="Error", description=str(error), color=0xE74C3C)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ---------- run ----------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        print("Fehler: DISCORD_TOKEN nicht gesetzt in der Umgebung.")
-        exit(1)
+        print("ERROR: DISCORD_TOKEN not set in environment.")
+        raise SystemExit(1)
     init_db()
     bot.run(DISCORD_TOKEN)
