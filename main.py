@@ -1,25 +1,32 @@
 # bot.py
 """
-Discord bot using Judge0 for sandboxed code execution + AI-like summary (placeholder).
-All user-facing messages are embeds and in English.
-Environment variables required:
-  - DISCORD_TOKEN (required)
-  - JUDGE0_URL (required) e.g. https://your-judge0.example.com
-Optional:
-  - JUDGE0_API_KEY
-  - JUDGE0_API_KEY_HEADER (defaults to "X-Auth-Token")
-  - DB_PATH (defaults to submissions.db)
-  - MAX_CODE_LENGTH
+Discord bot (discord.py) that uses Judge0 for executing code.
+Features:
+ - Automatically resolves a user-provided language string to a Judge0 language_id (using /languages).
+ - Detects external package imports (Python & JS heuristics) and warns in an embed.
+ - Optional `requirements` field (newline-separated packages) that the submitter can provide.
+ - All user-facing messages are English and use Discord embeds.
+ - Stores submissions and votes in a simple SQLite DB.
+ - Posts reviewed submissions to a configured form channel (Text or Forum).
+ - Vote buttons (upvote / downvote) with live counts stored in DB.
+
+Environment variables:
+ - DISCORD_TOKEN (required)
+ - JUDGE0_URL (required) e.g. https://judge0.example.com
+ - JUDGE0_API_KEY (optional)
+ - JUDGE0_API_KEY_HEADER (optional, default "X-Auth-Token")
+ - DB_PATH (optional, default submissions.db)
+ - MAX_CODE_LENGTH (optional, default 8000)
+ - REQUEST_TIMEOUT (optional, seconds for Judge0 API calls)
 """
 
 import os
 import re
 import json
 import sqlite3
-import textwrap
 import asyncio
 from io import BytesIO
-from typing import Union, Optional, Dict, Any
+from typing import Union, Optional, Dict, Any, List, Set
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
@@ -34,20 +41,21 @@ JUDGE0_API_KEY = os.getenv("JUDGE0_API_KEY")  # optional
 JUDGE0_API_KEY_HEADER = os.getenv("JUDGE0_API_KEY_HEADER", "X-Auth-Token")
 DB_PATH = os.getenv("DB_PATH", "submissions.db")
 MAX_CODE_LENGTH = int(os.getenv("MAX_CODE_LENGTH", "8000"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))  # seconds for Judge0 API calls
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 # ----------------------------
 
 if not DISCORD_TOKEN:
     print("ERROR: DISCORD_TOKEN not set in environment.")
     raise SystemExit(1)
 if not JUDGE0_URL:
-    print("ERROR: JUDGE0_URL not set in environment (e.g. https://judge0.example.com).")
+    print("ERROR: JUDGE0_URL not set in environment.")
     raise SystemExit(1)
 
+# ---------- Bot setup ----------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------- DB helpers (sqlite synchronous for simplicity) ----------
+# ---------- Simple SQLite DB helpers ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -64,6 +72,7 @@ def init_db():
         user_id INTEGER,
         language TEXT,
         code TEXT,
+        requirements TEXT,
         status TEXT,
         ai_summary TEXT,
         run_stdout TEXT,
@@ -97,11 +106,13 @@ def get_form_channel_db(guild_id: int) -> Optional[int]:
     conn.close()
     return row[0] if row else None
 
-def save_submission(guild_id, user_id, language, code, status="pending", ai_summary=None, stdout=None, stderr=None):
+def save_submission(guild_id, user_id, language, code, requirements=None, status="pending", ai_summary=None, stdout=None, stderr=None):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("INSERT INTO submissions(guild_id,user_id,language,code,status,ai_summary,run_stdout,run_stderr) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (guild_id, user_id, language, code, status, ai_summary, stdout, stderr))
+    cur.execute("""
+        INSERT INTO submissions(guild_id,user_id,language,code,requirements,status,ai_summary,run_stdout,run_stderr)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (guild_id, user_id, language, code, requirements, status, ai_summary, stdout, stderr))
     sub_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -143,7 +154,7 @@ def get_votes(submission_id):
     conn.close()
     return {"score": row[0] or 0, "count": row[1] or 0}
 
-# ---------- Basic static "malware" heuristics ----------
+# ---------- Static heuristics ----------
 SUSPICIOUS_PATTERNS = [
     r"\beval\(", r"\bexec\(", r"import\s+os", r"subprocess\.", r"socket\.", r"requests\.",
     r"open\([^)]*['\"]/etc", r"rm\s+-rf", r"os\.remove", r"shutil\.rmtree", r"popen\(",
@@ -154,7 +165,7 @@ def static_risk_check(code: str):
     reasons = []
     score = 0
     for pat in SUSPICIOUS_PATTERNS:
-        if re.search(pat, code):
+        if re.search(pat, code, re.IGNORECASE):
             reasons.append(f"Matched suspicious pattern: `{pat}`")
             score += 30
     if re.search(r"[A-Za-z0-9+/]{50,}={0,2}", code):
@@ -166,6 +177,66 @@ def static_risk_check(code: str):
     score = min(100, score)
     return score, reasons
 
+# ---------- Package detection heuristics ----------
+# Small Python stdlib set to avoid marking common stdlib modules as external.
+# This is not exhaustive but covers frequent modules.
+_PY_STDlib: Set[str] = {
+    "sys","os","re","math","json","time","datetime","itertools","functools","hashlib",
+    "subprocess","threading","asyncio","collections","pathlib","typing","random","statistics",
+    "http","urllib","socket","enum","statistics","statistics","csv","io","inspect"
+}
+
+def detect_python_imports(code: str) -> List[str]:
+    """
+    Return a list of top-level module names imported by Python code that look external.
+    Uses simple regex; will miss some complex imports.
+    """
+    mods = set()
+    # matches "import foo" or "import foo as bar" or "import foo, bar"
+    for m in re.finditer(r'^\s*import\s+([a-zA-Z0-9_.,\s]+)', code, re.MULTILINE):
+        names = m.group(1)
+        for part in re.split(r'\s*,\s*', names):
+            base = part.split('.')[0].strip()
+            if base and base not in _PY_STDlib:
+                mods.add(base)
+    # matches "from foo import bar"
+    for m in re.finditer(r'^\s*from\s+([a-zA-Z0-9_\.]+)\s+import', code, re.MULTILINE):
+        base = m.group(1).split('.')[0]
+        if base and base not in _PY_STDlib:
+            mods.add(base)
+    return sorted(mods)
+
+def detect_js_imports(code: str) -> List[str]:
+    """
+    Detect 'require("mod")' and 'import ... from "mod"' statements.
+    Returns base module names that look external.
+    """
+    mods = set()
+    for m in re.finditer(r'require\(\s*[\'"]([^\'"]+)[\'"]\s*\)', code):
+        base = m.group(1).split('/')[0]
+        if base and not base.startswith('.') and not base.startswith('/'):
+            mods.add(base)
+    for m in re.finditer(r'import\s+.*\s+from\s+[\'"]([^\'"]+)[\'"]', code):
+        base = m.group(1).split('/')[0]
+        if base and not base.startswith('.') and not base.startswith('/'):
+            mods.add(base)
+    return sorted(mods)
+
+def detect_external_packages(code: str, language_hint: str) -> List[str]:
+    """
+    Return list of detected external packages based on language hint (python/javascript/other).
+    """
+    hint = (language_hint or "").strip().lower()
+    if hint.startswith("py") or "python" in hint:
+        return detect_python_imports(code)
+    if hint.startswith("js") or "javascript" in hint or "node" in hint:
+        return detect_js_imports(code)
+    # fallback: do a very small generic search for 'import x' patterns
+    generic = []
+    for m in re.finditer(r'^\s*import\s+([a-zA-Z0-9_\.]+)', code, re.MULTILINE):
+        generic.append(m.group(1).split('.')[0])
+    return sorted(set(generic))
+
 # ---------- Judge0 helpers ----------
 def judge0_headers() -> Dict[str, str]:
     hdrs = {"Content-Type": "application/json"}
@@ -173,46 +244,76 @@ def judge0_headers() -> Dict[str, str]:
         hdrs[JUDGE0_API_KEY_HEADER] = JUDGE0_API_KEY
     return hdrs
 
-async def fetch_judge0_languages(session: aiohttp.ClientSession) -> Optional[list]:
+async def fetch_judge0_languages(session: aiohttp.ClientSession) -> Optional[List[dict]]:
     url = JUDGE0_URL.rstrip("/") + "/languages"
     try:
         async with session.get(url, headers=judge0_headers(), timeout=REQUEST_TIMEOUT) as resp:
             if resp.status == 200:
                 return await resp.json()
-            else:
-                return None
+            # some judge0 instances use /languages? (handle gracefully)
+            return None
     except Exception:
         return None
 
 async def find_language_id(session: aiohttp.ClientSession, user_lang: str) -> Optional[int]:
     """
     Resolve a user-supplied language string to Judge0 language_id.
-    Strategy: fetch /languages and match by name or by alias.
+    Strategy:
+      - fetch /languages once and cache per process
+      - try exact matches on id/name/aliases; then substring matches
+      - allow numeric ids
     """
-    langs = await fetch_judge0_languages(session)
-    if not langs:
+    user_lang_norm = (user_lang or "").strip().lower()
+    if user_lang_norm == "":
         return None
-    target = user_lang.strip().lower()
-    # langs: list of objects; try to be flexible
+
+    # numeric
+    if user_lang_norm.isdigit():
+        return int(user_lang_norm)
+
+    # cached languages on the bot object (in-memory)
+    if not hasattr(bot, "_cached_judge0_languages") or bot._cached_judge0_languages is None:
+        async with aiohttp.ClientSession() as s:
+            langs = await fetch_judge0_languages(s)
+        bot._cached_judge0_languages = langs or []
+
+    langs = bot._cached_judge0_languages or []
+    # first pass: exact matches on name or language fields or aliases
     for lang in langs:
-        # lang can have fields like 'id','name','aliases' or 'language' etc.
-        values = []
-        for k in ("name", "language", "aliases", "version"):
+        # lang is typically dict with fields like id, name, aliases, language
+        cand_values = []
+        for k in ("name","language","aliases"):
             v = lang.get(k) if isinstance(lang, dict) else None
             if v:
                 if isinstance(v, list):
-                    values.extend([str(x).lower() for x in v])
+                    cand_values.extend([str(x).lower() for x in v])
                 else:
-                    values.append(str(v).lower())
-        # also ensure id and raw string representation
-        if str(lang.get("id", "")).lower() == target:
+                    cand_values.append(str(v).lower())
+        # also include id as string
+        if str(lang.get("id","")).lower() == user_lang_norm:
             return int(lang["id"])
-        for val in values:
-            if target == val or target in val:
+        for v in cand_values:
+            if user_lang_norm == v:
                 return int(lang["id"])
-    # last resort: try numeric
-    if user_lang.isdigit():
-        return int(user_lang)
+    # second pass: substring match
+    for lang in langs:
+        text = " ".join([ str(lang.get(k,"")) for k in ("id","name","language") ]).lower()
+        if user_lang_norm in text:
+            return int(lang["id"])
+    # third: some common alias map (fallback)
+    fallback_aliases = {
+        "py": "python",
+        "python3": "python",
+        "js": "javascript",
+        "node": "javascript",
+        "c++": "cpp",
+        "c#": "csharp",
+    }
+    if user_lang_norm in fallback_aliases:
+        mapped = fallback_aliases[user_lang_norm]
+        for lang in langs:
+            if mapped in str(lang.get("name","")).lower() or mapped in str(lang.get("language","")).lower():
+                return int(lang["id"])
     return None
 
 async def submit_to_judge0(session: aiohttp.ClientSession, language_id: int, code: str) -> Dict[str, Any]:
@@ -233,7 +334,7 @@ async def submit_to_judge0(session: aiohttp.ClientSession, language_id: int, cod
         except Exception:
             return {"error": f"Judge0 returned non-JSON response (status {resp.status}): {text}"}
 
-# ---------- Create highlight "screenshot" (image) ----------
+# ---------- Render a small code highlight image ----------
 def render_code_highlight_image(code: str, highlight_lines=(0,5)):
     lines = code.splitlines()
     start, end = highlight_lines
@@ -250,16 +351,14 @@ def render_code_highlight_image(code: str, highlight_lines=(0,5)):
     line_sizes = [font.getsize(l)[0] for l in text.splitlines()] if text.splitlines() else [0]
     max_w = max(line_sizes + [0])
     h = (font.getsize("A")[1] * (len(text.splitlines()) + 1)) + 2 * margin
-    w = max_w + 2 * margin
-    if w < 200:
-        w = 200
+    w = max(max_w + 2*margin, 220)
     img = Image.new("RGBA", (w, h), (30, 30, 34, 255))
     draw = ImageDraw.Draw(img)
     draw.text((margin, margin), text, font=font, fill=(230, 230, 230))
     draw.rectangle([0,0,w,28], fill=(50,50,55,255))
     return img
 
-# ---------- Discord UI: Vote Buttons ----------
+# ---------- Vote UI ----------
 class VoteView(discord.ui.View):
     def __init__(self, submission_id: int, timeout=None):
         super().__init__(timeout=timeout)
@@ -308,8 +407,8 @@ async def set_form_channel(interaction: discord.Interaction, channel: Union[disc
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="submit_code", description="Submit code for static review and optional sandboxed execution.")
-@app_commands.describe(language="Programming language (name or Judge0 language id)", code="Your code (markdown or plain text).")
-async def submit_code(interaction: discord.Interaction, language: str, code: str):
+@app_commands.describe(language="Programming language (name or Judge0 language id)", code="Your code (markdown or plain text)", requirements="Optional newline-separated packages you expect (e.g. discord.py)")
+async def submit_code(interaction: discord.Interaction, language: str, code: str, requirements: Optional[str] = None):
     await interaction.response.defer(thinking=True)
     guild = interaction.guild
     if not guild:
@@ -328,7 +427,7 @@ async def submit_code(interaction: discord.Interaction, language: str, code: str
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
-    submission_id = save_submission(guild.id, interaction.user.id, language, code, status="reviewing")
+    submission_id = save_submission(guild.id, interaction.user.id, language, code, requirements=requirements, status="reviewing")
 
     # static/AI placeholder review
     risk_score, reasons = static_risk_check(code)
@@ -352,22 +451,50 @@ async def submit_code(interaction: discord.Interaction, language: str, code: str
             pass
         return
 
+    # detect external packages
+    detected_pkgs = detect_external_packages(code, language)
+    req_list = []
+    if requirements:
+        # split on newlines or commas
+        for line in re.split(r'[\n,]+', requirements):
+            s = line.strip()
+            if s:
+                req_list.append(s)
+
+    # If detected packages and no explicit requirements specified, warn user that Judge0 may not have them
+    pkg_note = ""
+    if detected_pkgs:
+        pkg_note = "Detected imports that may require external packages: " + ", ".join(detected_pkgs) + ".\n"
+        pkg_note += "Judge0 may not have these packages preinstalled. If you control the Judge0 instance, install them there or provide a `requirements` list. Execution may fail if packages are missing."
+    if req_list:
+        pkg_note += "\nRequested requirements: " + ", ".join(req_list)
+
     # Resolve language -> judge0 language_id
     async with aiohttp.ClientSession() as session:
         lang_id = await find_language_id(session, language)
         if lang_id is None:
-            # Try a helpful fallback: ask Judge0 for available languages (first 20)
+            # Try to offer sample languages
             langs = await fetch_judge0_languages(session)
+            sample = "Could not fetch languages from Judge0"
             if langs:
                 sample = ", ".join([str(l.get("name") or l.get("language") or l.get("id")) for l in langs[:20]])
-            else:
-                sample = "Could not fetch languages from Judge0"
             update_submission_result(submission_id, status="lang_not_found")
             embed = discord.Embed(title="Language Not Found", description=f"Could not resolve `{language}` to a Judge0 language id.\n\nSample languages: {sample}", color=0xE67E22)
             await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
-        # Submit to Judge0
+        # Build an initial embed preview for the user (shows detected packages, warnings)
+        preview = discord.Embed(title="Execution Preview", color=0x3498DB)
+        preview.add_field(name="Language (resolved)", value=str(lang_id), inline=True)
+        preview.add_field(name="Detected packages", value=(", ".join(detected_pkgs) or "None detected"), inline=False)
+        if req_list:
+            preview.add_field(name="Requested requirements", value=", ".join(req_list), inline=False)
+        if pkg_note:
+            preview.add_field(name="Note", value=pkg_note[:1000], inline=False)
+        preview.set_footer(text=f"Submission ID: {submission_id}")
+        await interaction.followup.send(embed=preview, ephemeral=True)
+
+        # Submit to Judge0 (synchronous wait=true)
         try:
             result = await submit_to_judge0(session, lang_id, code)
         except asyncio.TimeoutError:
@@ -393,11 +520,12 @@ async def submit_code(interaction: discord.Interaction, language: str, code: str
         return
 
     # Parse Judge0 response
+    # Judge0 v1 returns fields like stdout, stderr, compile_output, status, time, memory
     stdout = result.get("stdout") or ""
     stderr = result.get("stderr") or ""
     compile_out = result.get("compile_output") or ""
     status_obj = result.get("status") or {}
-    status_desc = status_obj.get("description") or str(status_obj)
+    status_desc = status_obj.get("description") if isinstance(status_obj, dict) else str(status_obj)
     time_used = result.get("time")
     memory_used = result.get("memory")
 
@@ -438,6 +566,11 @@ async def submit_code(interaction: discord.Interaction, language: str, code: str
     post_embed.add_field(name="Status", value="Executed & Reviewed", inline=True)
     post_embed.add_field(name="AI Analysis (short)", value=(ai_analysis[:1000] if ai_analysis else "—"), inline=False)
     post_embed.add_field(name="Output (short)", value=(stdout or "no output")[:1000], inline=False)
+    # show detected packages/warnings again
+    if detected_pkgs:
+        post_embed.add_field(name="Detected packages", value=", ".join(detected_pkgs), inline=False)
+    if req_list:
+        post_embed.add_field(name="Requested requirements", value=", ".join(req_list), inline=False)
     post_embed.set_footer(text=f"ID: {submission_id}")
 
     view = VoteView(submission_id)
@@ -447,6 +580,7 @@ async def submit_code(interaction: discord.Interaction, language: str, code: str
     confirm_embed = discord.Embed(title="Submission Posted", description=f"Your submission (ID {submission_id}) was reviewed and posted to {channel.mention}.", color=0x2ECC71)
     await interaction.followup.send(embed=confirm_embed, ephemeral=True)
 
+# ---------- Error handling for missing perms ----------
 @set_form_channel.error
 async def set_form_channel_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.errors.MissingPermissions):
